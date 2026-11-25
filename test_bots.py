@@ -102,19 +102,14 @@ class WeddingTest(unittest.TestCase):
         self.assertEqual(self.db.execute("select count(*) from stay_jobs").fetchone()[0], 0)
         self.assertIn("#1 sent", guest("search"))
         self.assertIn("Guest hotel request #1", desk("/stays"))
-        with patch("hotels_worker.api", side_effect=[
-            {"run_id": "booking-123"}, {"run_id": "expedia-123"},
-            {"status": "COMPLETED", "result": {"quotes": [QUOTE]}},
-            {"status": "FAILED"},
-        ]):
-            for _ in range(2):
-                hotels_worker.step(self.db, {10})
+        with patch("tiny_browser.create", side_effect=[("br-a", "wss://a"), ("br-b", "wss://b")]), \
+                patch("tiny_browser.close") as close, patch("hotels_worker.browser_search", side_effect=[
+                    {"quotes": [QUOTE], "note": ""}, {"quotes": [], "note": "Provider blocked."}]):
+            hotels_worker.step(self.db, {10})
             self.db.close()
             self.db = sqlite3.connect(self.path)
-            self.db.execute("UPDATE stay_jobs SET next_at=0")
-            self.db.commit()
-            for _ in range(2):
-                hotels_worker.step(self.db, {10})
+            hotels_worker.step(self.db, {10})
+            self.assertEqual(close.call_count, 2)
         result = desk("/staystatus 1")
         self.assertIn("8,999.00", result)
         self.assertIn("Expedia", result)

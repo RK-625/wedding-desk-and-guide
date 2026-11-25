@@ -92,9 +92,13 @@ class WorkerTest(unittest.TestCase):
         key = patch.dict(os.environ, TINYFISH_API_KEY="test")
         key.start()
         self.addCleanup(key.stop)
-        http = patch.object(worker, "api")
-        self.http = http.start()
-        self.addCleanup(http.stop)
+        for name, target in [("create", "hotels_worker.tiny_browser.create"), ("close", "hotels_worker.tiny_browser.close"),
+                             ("search", "hotels_worker.browser_search"), ("legacy", "hotels_worker.legacy_get")]:
+            mocker = patch(target)
+            setattr(self, name, mocker.start())
+            self.addCleanup(mocker.stop)
+        self.create.side_effect = [("br-book","wss://browser.test/cdp?secret=first"),
+                                   ("br-exp","wss://browser.test/cdp?secret=second")]
 
     def due(self):
         with self.db:
@@ -106,21 +110,21 @@ class WorkerTest(unittest.TestCase):
     def test_partial_provider_and_delivery_once(self):
         exp = dict(QUOTE, hotel="Second Example", url="https://www.expedia.com/Place.h123.Hotel-Information",
                    full_stay_total=False)
-        self.http.side_effect = [{"run_id": "book-1"}, {"run_id": "exp-2"},
-             {"status": "COMPLETED", "result": {"quotes": [QUOTE]}},
-             {"status": "COMPLETED", "result": {"quotes": [exp]}}]
+        self.search.side_effect = [{"quotes": [QUOTE]}, {"quotes": [exp]}]
         self.run_step()
-        self.run_step()
-        post = self.http.call_args_list[0]
-        self.assertEqual(post.args, ("POST", "/automation/run-async"))
-        payload = post.kwargs["json"]
-        self.assertFalse(payload["use_vault"])
-        self.assertNotIn("777", payload["goal"])
-        self.assertIn("group_children=1", payload["url"])
-        self.due()
-        self.run_step()
+        args = self.search.call_args.args
+        self.assertEqual(args[1], "booking")
+        self.assertNotIn("777", json.dumps(args[2]))
+        self.assertIn("group_children=1", args[3])
         self.assertIsNone(worker.report(self.db, 1))
         self.run_step()
+        self.assertEqual(self.create.call_count, 2)
+        self.assertEqual([c.args[0] for c in self.close.call_args_list], ["br-book", "br-exp"])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stay_browser_cleanup").fetchone()[0], 0)
+        self.legacy.assert_not_called()
+        dumped = "\n".join(self.db.iterdump())
+        self.assertNotIn("secret=first", dumped)
+        self.assertNotIn("secret=second", dumped)
         report = worker.report(self.db, 1)
         self.assertLess(report.index("Source-reported match"), report.index("Partial match"))
         self.assertIn("INR 8,999.00", report)
@@ -130,19 +134,56 @@ class WorkerTest(unittest.TestCase):
         self.assertFalse(self.run_step())
         self.assertEqual(delivered, self.db.execute("SELECT body FROM replies").fetchall())
 
-    def test_interrupted_post_reconciles_before_poll(self):
-        self.http.side_effect = requests.Timeout()
+    def test_interrupted_create_is_not_replayed(self):
+        with self.db:
+            self.db.execute("UPDATE stay_jobs SET status='creating',attempts=1 WHERE provider='booking'")
         self.run_step()
-        self.assertEqual(self.db.execute("SELECT status FROM stay_jobs WHERE provider='booking'").fetchone()[0],
-                         "starting")
-        marker = self.db.execute("SELECT marker FROM stay_jobs WHERE provider='booking'").fetchone()[0]
-        self.due()
-        self.http.side_effect = None
-        self.http.return_value = {"data": [{"run_id": "original", "goal": "Task " + marker}]}
+        self.create.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT status FROM stay_jobs WHERE provider='booking'").fetchone()[0], "done")
+
+    def test_crashed_known_session_cleanup_and_bounded_restart(self):
+        with self.db:
+            self.db.execute("UPDATE stay_jobs SET status='browsing',run_id='br-old',attempts=1 WHERE provider='booking'")
+            self.db.execute("INSERT INTO stay_browser_cleanup VALUES('br-old',0,?)", (int(time.time())+600,))
+        self.run_step()  # cleanup from crashed process
+        self.close.assert_called_once_with("br-old")
+        self.run_step()  # search may retry once
+        self.assertEqual(self.db.execute("SELECT status FROM stay_jobs WHERE provider='booking'").fetchone()[0], "queued")
+        self.create.assert_not_called()
+        with self.db:
+            self.db.execute("UPDATE stay_jobs SET status='browsing',next_at=0,attempts=2 WHERE provider='booking'")
         self.run_step()
-        self.assertEqual(self.http.call_args.args, ("GET", "/runs"))
-        self.assertEqual(self.db.execute("SELECT run_id FROM stay_jobs WHERE provider='booking'").fetchone()[0],
-                         "original")
+        self.assertEqual(self.db.execute("SELECT status FROM stay_jobs WHERE provider='booking'").fetchone()[0], "done")
+        self.create.assert_not_called()
+
+    def test_search_exception_releases_session_and_retries_cleanup(self):
+        self.search.side_effect = RuntimeError("wss://browser.test/cdp?secret=first")
+        self.close.side_effect = [requests.Timeout(), None]
+        with self.assertLogs(level="WARNING") as logs:
+            self.run_step()
+        self.assertNotIn("secret=first", str(logs.output))
+        self.assertEqual(self.db.execute("SELECT session_id FROM stay_browser_cleanup").fetchone()[0], "br-book")
+        with self.db:
+            self.db.execute("UPDATE stay_browser_cleanup SET due=0")
+        self.run_step()
+        self.assertEqual(self.close.call_count, 2)
+        self.assertEqual(self.create.call_count, 1)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stay_browser_cleanup").fetchone()[0], 0)
+
+    def test_migration_recovers_legacy_running_job(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        db.executescript("""
+            CREATE TABLE stay_jobs (request_id INTEGER,provider TEXT,status TEXT,run_id TEXT,
+            created_at INTEGER,next_at INTEGER,started INTEGER,marker TEXT,lease TEXT,quotes TEXT,
+            note TEXT,checked INTEGER,PRIMARY KEY(request_id,provider));
+            INSERT INTO stay_jobs(request_id,provider,status) VALUES(1,'booking','running'),(1,'expedia','queued');
+        """)
+        worker.setup(db)
+        self.assertEqual(db.execute("SELECT engine FROM stay_jobs ORDER BY provider").fetchall(),
+                         [("tinyagent",), ("tinybrowser",)])
+        worker.setup(db) # rerunning setup preserves engine evidence
+        self.assertEqual(db.execute("SELECT engine FROM stay_jobs WHERE provider='booking'").fetchone()[0], "tinyagent")
 
     def test_missing_key_and_expired_search(self):
         with patch.dict(os.environ, TINYFISH_API_KEY=""):
@@ -150,7 +191,7 @@ class WorkerTest(unittest.TestCase):
         with self.db:
             self.db.execute("UPDATE stay_jobs SET started=? WHERE provider='expedia'", (int(time.time())-3600,))
         self.run_step()
-        self.http.assert_not_called()
+        self.create.assert_not_called()
         report = worker.report(self.db, 1)
         self.assertIn("key is missing", report)
         self.assertIn("timed out", report)
@@ -164,11 +205,12 @@ class WorkerTest(unittest.TestCase):
 
     def test_transient_poll_does_not_restart_submit(self):
         with self.db:
-            self.db.execute("UPDATE stay_jobs SET status='running',run_id='run_abc' WHERE provider='booking'")
+            self.db.execute("UPDATE stay_jobs SET engine='tinyagent',status='running',run_id='run_abc' WHERE provider='booking'")
         error = requests.Response()
         error.status_code = 503
-        self.http.side_effect = requests.HTTPError(response=error)
+        self.legacy.side_effect = requests.HTTPError(response=error)
         self.run_step()
-        self.assertEqual(self.http.call_args.args, ("GET", "/runs/run_abc"))
+        self.assertEqual(self.legacy.call_args.args, ("/runs/run_abc",))
+        self.create.assert_not_called()
         self.assertEqual(self.db.execute("SELECT status,run_id FROM stay_jobs WHERE provider='booking'").fetchone(),
                          ("running", "run_abc"))

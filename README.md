@@ -51,8 +51,12 @@ Set DEEPSEEK_API_KEY in .env and restart the bots. Invited guests can ask free-t
 Set TINYFISH_API_KEY and DEEPSEEK_API_KEY in the local .env and restart. At least one organizer must have started a private chat with Wedding Desk to receive notifications. The existing bot process runs the search worker alongside the two Telegram clients.
 
 1. An invited guest tells Wedding Guide, for example, “We need a hotel in Whitefield, Bengaluru, January 15–17, 2027. One room for two adults and no children, up to INR 30,000 total.” Use future dates. The guest can also send /stay to begin.
-2. Wedding Guide asks for missing details and shows a preview of the dates, room allocation, budget and requirements. The guest can edit it, cancel it, or reply **search** to submit. A submission starts up to one billable TinyFish browser search on each of Booking.com and Expedia.
+2. Wedding Guide asks for missing details and shows a preview of the dates, room allocation, budget and requirements. The guest can edit it, cancel it, or reply **search** to submit. A submission starts a quote search on Booking.com and Expedia. Each provider gets a remote TinyBrowser session. The bot connects Playwright over CDP, and DeepSeek selects from observed property links and reads page evidence. Browser time and DeepSeek usage are billable.
 3. Wedding Desk sends the organizer a numbered request, followed by a report. Each hotel's supporting evidence, price basis, tax status, missing details and source link are shown when available. A blocked site, unavailable inventory or incomplete pricing may yield zero verified matches. Quoting does not reserve a room.
 4. The organizer can ask for recent hotel requests, send /stays, or retrieve a saved report with /staystatus followed by the request number. Pending searches and reports persist in the same SQLite file across restarts.
 
 TinyFish receives the stay criteria. The organizer sees the guest account reference locally. For a comparison, specify the currency and whether a budget applies per room, per night, or to the whole stay.
+
+### Remote browser lifecycle
+
+The Python worker creates an isolated browser at https://api.browser.tinyfish.ai using TINYFISH_API_KEY, connects to the returned CDP WebSocket, then terminates the session. A short inactivity timeout bounds abandoned sessions. Install the Python dependencies from requirements.txt; remote Chromium requires no local browser installation. See the [TinyBrowser API reference](https://docs.tinyfish.ai/tinybrowser/reference).
