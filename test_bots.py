@@ -44,13 +44,14 @@ class WeddingTest(unittest.TestCase):
         response._content = json.dumps({"ok": True, "result": result}).encode()
         return response
 
-    def send(self, role, text, uid=None, chat_type="private"):
+    def send(self, role, text, uid=None, chat_type="private", voice=None):
         self.role = role
         updates = self.messages.setdefault(role, [])
         uid = uid or (10 if role == "organizer" else 20)
         updates.append({"update_id": len(updates)+1, "message": {
             "message_id": 1, "date": 1, "chat": {"id": uid, "type": chat_type},
-            "from": {"id": uid, "first_name": "Test", "is_bot": False}, "text": text}})
+            "from": {"id": uid, "first_name": "Test", "is_bot": False}, "text": text,
+            **({"voice": voice} if voice else {})}})
         self.sent.clear()
         process_updates(self.db, role, self.clients[role], {10}, "wedding_test_bot")
         return "\n".join(self.sent)
@@ -95,13 +96,21 @@ class WeddingTest(unittest.TestCase):
         def desk(text):
             return self.send("organizer", text)
 
+        self.assertIn("No guest hotel requests", desk("still searching ???"))
         self.assertIn("invitation", guest("We need a hotel"))
         guest("/start " + desk("/invite").split("?start=")[1])
         with patch("stays.extract", return_value=dict(DETAILS, intent=True, clarify=None)):
             self.assertIn("Whitefield", guest("Find a hotel for our family"))
         self.assertEqual(self.db.execute("select count(*) from stay_jobs").fetchone()[0], 0)
+        with patch("stays.flag_enabled", return_value=False):
+            self.assertIn("searches are paused", guest("search"))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM stay_jobs").fetchone()[0], 0)
         self.assertIn("#1 sent", guest("search"))
         self.assertIn("Guest hotel request #1", desk("/stays"))
+        with patch("organizer.chat", side_effect=AssertionError("Status should come from SQLite")):
+            self.assertIn("Booking.com: queued", desk("still searching ???"))
+            self.assertIn("Expedia: queued", desk("What’s the status of hotel request #1?"))
+            self.assertIn("No hotel request", desk("Status of hotel request #2"))
         with patch("tiny_browser.create", side_effect=[("br-a", "wss://a"), ("br-b", "wss://b")]), \
                 patch("tiny_browser.close") as close, patch("hotels_worker.browser_search", side_effect=[
                     {"quotes": [QUOTE], "note": ""}, {"quotes": [], "note": "Provider blocked."}]):
@@ -114,9 +123,30 @@ class WeddingTest(unittest.TestCase):
         self.assertIn("8,999.00", result)
         self.assertIn("Expedia", result)
         self.assertIn(QUOTE["url"], result)
+        self.assertEqual(desk("still searching?"), desk("/staystatus 1"))
         self.assertNotIn(QUOTE["url"], self.send("organizer", "/staystatus 1", uid=20))
         self.assertNotIn(QUOTE["url"], guest("/staystatus 1"))
         self.assertEqual(self.db.execute("SELECT count(*) FROM stay_reports").fetchone()[0], 1)
+
+    @patch.dict("os.environ", SARVAM_API_KEY="test")
+    def test_guest_voice_note_requires_invitation_flag_and_typed_confirmation(self):
+        voice = {"duration": 10, "file_id": "clip", "file_unique_id": "unique"}
+        bot = self.clients["guest"]
+        with patch("sponsor_services.flag_enabled", return_value=False) as enabled, \
+                patch.object(bot, "get_file") as get_file, patch.object(bot, "download_file", return_value=b"audio"), \
+                patch("sponsor_services.transcribe", side_effect=["A hotel in Whitefield for our family", "Search."]), \
+                patch("stays.extract", return_value=dict(DETAILS, intent=True, clarify=None)):
+            self.assertIn("invitation", self.send("guest", None, voice=voice))
+            invite = self.send("organizer", "/invite").split("?start=")[1]
+            self.send("guest", "/start " + invite)
+            self.assertIn("Voice notes are unavailable", self.send("guest", None, voice=voice))
+            get_file.assert_not_called()
+            enabled.return_value = True
+            result = self.send("guest", None, voice=voice)
+            self.assertIn("I heard: A hotel", result)
+            self.assertIn("Reply “search”", result)
+            self.assertIn("Please type", self.send("guest", None, voice=voice))
+            self.assertEqual(self.db.execute("SELECT count(*) FROM stay_jobs").fetchone()[0], 0)
 
     def test_delivery_retry(self):
         self.offline = True

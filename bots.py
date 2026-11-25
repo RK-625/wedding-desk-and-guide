@@ -1,6 +1,7 @@
 """Two Telegram bots, one wedding, one local database. Python 3.9+."""
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -10,10 +11,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 import organizer
+import sponsor_services
 import stays
 import hotels_worker
 import json
 from telebot import TeleBot, apihelper
+from requests import RequestException
 
 
 ORG_HELP = """Organizer commands (times are IST)
@@ -106,6 +109,18 @@ def reply(db, role, uid, message, admins, botname):
     if role == "organizer":
         if uid not in admins:
             return "This bot is for the wedding organizers. Ask your host for the guest invitation."
+        question = " ".join(message.casefold().replace("’", "'").split()).rstrip(" ?!.")
+        status = re.fullmatch(
+            r"(?:(?:what's|what is) (?:the )?)?status (?:of|for) (?:hotel |stay )?request #?(\d+)",
+            question,
+        )
+        if status:
+            command, arg = "/staystatus", status[1]
+        elif question in {"still searching", "are you still searching", "is it still searching"}:
+            latest = db.execute("SELECT id FROM stay_requests ORDER BY id DESC LIMIT 1").fetchone()
+            if latest is None:
+                return "No guest hotel requests yet."
+            command, arg = "/staystatus", str(latest[0])
         if command == "/stays":
             rows = db.execute("SELECT id, details FROM stay_requests ORDER BY id DESC LIMIT 20")
             lines = []
@@ -115,17 +130,19 @@ def reply(db, role, uid, message, admins, botname):
             return "\n".join(lines) or "No guest hotel requests yet."
         if command == "/staystatus":
             number = arg.strip().lstrip("#")
-            request = db.execute("SELECT guest,details FROM stay_requests WHERE id=?", (number,)).fetchone()
+            request = db.execute("SELECT id,guest,details FROM stay_requests WHERE id=?", (number,)).fetchone()
             if not request:
                 return "No hotel request with that number. Send /stays to see recent requests."
-            heading = f"Guest ID {request[0]}\n{stays.summary(json.loads(request[1]))}\n"
-            report = hotels_worker.report(db, number)
+            request_id, guest_id, details = request
+            heading = f"Hotel request #{request_id} · Guest ID {guest_id}\n{stays.summary(json.loads(details))}\n"
+            report = hotels_worker.report(db, request_id)
             if report:
                 return heading + report
             jobs = db.execute("SELECT provider,status FROM stay_jobs WHERE request_id=? ORDER BY provider",
-                              (number,)).fetchall()
+                              (request_id,)).fetchall()
             if jobs:
-                return heading + "Stay #" + number + "\n" + "\n".join(f"{provider}: {status}" for provider, status in jobs)
+                return heading + "\n".join(f"{hotels_worker.PROVIDERS.get(provider, provider)}: {status}"
+                                           for provider, status in jobs)
             return "No hotel request with that number. Send /stays to see recent requests."
         if command == "/faq":
             topic, _, answer = arg.partition("|")
@@ -215,6 +232,30 @@ def reply(db, role, uid, message, admins, botname):
     return "\n".join(parts) or GUEST_HELP
 
 
+def voice_reply(db, bot, msg, admins, guest_name):
+    uid = msg.from_user.id
+    if not db.execute("SELECT 1 FROM guests WHERE id=?", (uid,)).fetchone():
+        return "Open the invitation link from your wedding organizer, then tap Start."
+    key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not key or not sponsor_services.flag_enabled("guest_voice_notes", default=False):
+        return "Voice notes are unavailable. Please send your message as text."
+    if not 0 < msg.voice.duration <= 30 or (msg.voice.file_size or 0) > 2_000_000:
+        return "Please send a voice note of 30 seconds or less, or type your message."
+    try:
+        info = bot.get_file(msg.voice.file_id)
+        audio = bot.download_file(info.file_path)
+        if len(audio) > 2_000_000:
+            return "Please send a shorter voice note, or type your message."
+        transcript = sponsor_services.transcribe(audio, key)
+    except (apihelper.ApiException, RequestException, ValueError, KeyError) as exc:
+        logging.warning("Guest voice note could not be transcribed (%s)", type(exc).__name__)
+        return "I couldn’t transcribe that voice note. Try again or type your message."
+    heard = f"I heard: {transcript}"
+    if transcript.startswith("/") or stays.message_key(transcript) in stays.CONFIRM | stays.CANCEL:
+        return heard + "\n\nPlease type commands or hotel confirmations."
+    return heard + "\n\n" + reply(db, "guest", uid, transcript, admins, guest_name)
+
+
 def process_updates(db, role, bot, admins, guest_name):
     # Commit the reply and the offset together so retrying cannot create a second event.
     flush_replies(db, role, bot)
@@ -226,6 +267,8 @@ def process_updates(db, role, bot, admins, guest_name):
             if msg and msg.chat.type == "private" and msg.from_user:
                 if msg.text == "/id":
                     answer = f"Your Telegram user ID is {msg.from_user.id}."
+                elif role == "guest" and msg.voice:
+                    answer = voice_reply(db, bot, msg, admins, guest_name)
                 else:
                     answer = reply(db, role, msg.from_user.id, msg.text or "/help", admins, guest_name)
                 for start in range(0, len(answer), 2000):

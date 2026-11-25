@@ -40,7 +40,7 @@ Open the invitation in the guest bot and tap Start. Anyone with the invitation c
 
 Use /help in either bot to see its commands. All event times are IST. Guest questions match published event names and FAQ topics. Private bookings are visible only to allowlisted organizers. Use /remove with an item ID from /schedule or /bookings to remove an event or booking.
 
-This text-based MVP runs before adding Sarvam voice transcription, Flagsmith, or NudgeBee. A real Telegram session requires your bot credentials.
+A real Telegram session requires your bot credentials.
 
 ## Optional conversational guest guidance
 
@@ -56,6 +56,15 @@ Set TINYFISH_API_KEY and DEEPSEEK_API_KEY in the local .env and restart. At leas
 4. The organizer can ask for recent hotel requests, send /stays, or retrieve a saved report with /staystatus followed by the request number. Pending searches and reports persist in the same SQLite file across restarts.
 
 TinyFish receives the stay criteria. The organizer sees the guest account reference locally. For a comparison, specify the currency and whether a budget applies per room, per night, or to the whole stay.
+
+## Telegram voice notes and Flagsmith controls
+
+1. Set `SARVAM_API_KEY` and `FLAGSMITH_SERVER_KEY` in the local `.env`. Copy the server-side environment key from the Development environment's **SDK Keys** page.
+2. Create the boolean flags `guest_voice_notes` and `hotel_search_enabled` in the same environment. Enable both for the demo. Flag changes take effect on the next eligible message after the bot's ten-second cache window.
+3. As an invited guest, send Wedding Guide a Telegram voice note of up to 30 seconds. Saaras translates the audio to English. The bot echoes the transcript and uses the existing guest chat and hotel intake to answer or show a draft. Type **search** to submit a reviewed draft.
+4. Disable `hotel_search_enabled` and try submitting a draft. The bot keeps the draft and pauses new submissions. Re-enable the flag and type **search** again. Existing searches can finish while new submissions are paused.
+
+Guests' audio goes to Sarvam for translation. The bot sends no guest data to Flagsmith. Without a working Flagsmith connection or matching flag, voice notes default to off and text hotel submissions default to on.
 
 ### Remote browser lifecycle
 

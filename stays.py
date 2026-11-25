@@ -7,6 +7,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from openai import OpenAI, OpenAIError
+from sponsor_services import flag_enabled
 
 INTEREST = re.compile(
     r"\b(hotels?|accommodations?|lodging|check[- ]?in|check[- ]?out|guest ?houses?|"
@@ -109,9 +110,13 @@ def summary(details):
             + f"\nBudget: {details['budget'] or 'Not specified'}\nMust-haves: {details['requirements'] or 'None specified'}")
 
 
+def message_key(text):
+    return " ".join(text.lower().strip(".!? ").split())
+
+
 def handle(db, uid, message, admins):
     text = message.strip()
-    key = " ".join(text.lower().strip(".!? ").split())
+    key = message_key(text)
     command = key.split(" ", 1)[0].split("@")[0]
     row = db.execute("SELECT draft,ready FROM stay_drafts WHERE guest=?", (uid,)).fetchone()
     if command.startswith("/") and command not in {"/stay", "/cancel"}:
@@ -127,6 +132,8 @@ def handle(db, uid, message, admins):
         if date.fromisoformat(details["check_in"]) < today():
             db.execute("UPDATE stay_drafts SET ready=0 WHERE guest=?", (uid,))
             return "The check-in date has passed. What new dates should I use?"
+        if not flag_enabled("hotel_search_enabled", default=True):
+            return "New hotel searches are paused. Your draft is saved. Try “search” again later."
         if not admins or not os.getenv("TINYFISH_API_KEY", "").strip():
             return "The organizer’s hotel search is unavailable. Your draft is saved. Try “search” again later."
         consumed = db.execute("DELETE FROM stay_drafts WHERE guest=? AND ready=1 AND draft=?", (uid, row[0])).rowcount
