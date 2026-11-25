@@ -1,5 +1,4 @@
 """Two Telegram bots, one wedding, one local database. Python 3.9+."""
-import requests
 import logging
 import os
 import secrets
@@ -9,6 +8,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
+from openai import OpenAI, OpenAIError
+import organizer
 from telebot import TeleBot, apihelper
 
 
@@ -32,6 +33,7 @@ GUEST_HELP = """Welcome to the wedding! Try asking “Where is the sangeet?” o
 
 def setup(db):
     db.executescript("""
+    CREATE TABLE IF NOT EXISTS organizer_chat(uid INTEGER PRIMARY KEY, turns TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS guests(id INTEGER PRIMARY KEY, party INTEGER, veg INTEGER);
     CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT,
@@ -73,19 +75,18 @@ def guest_ai_answer(question, events, faqs):
         + render(events) + "\nHost FAQs:\n" + show_guidance(faqs)
     )
     try:
-        response = requests.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"model": os.getenv("DEEPSEEK_MODEL") or "deepseek-flash",
-                  "messages": [{"role": "system", "content": instructions},
-                               {"role": "user", "content": question}],
-                  "thinking": {"type": "disabled"}, "max_tokens": 300},
-            timeout=(3, 12),
-        )
-        response.raise_for_status()
-        answer = response.json()["choices"][0]["message"]["content"]
-        return answer.strip() if isinstance(answer, str) else None
-    except (requests.RequestException, ValueError, KeyError, IndexError, TypeError) as exc:
+        with OpenAI(api_key=key, base_url="https://api.deepseek.com",
+                    timeout=12.0, max_retries=0) as client:
+            response = client.chat.completions.create(
+                model=os.getenv("DEEPSEEK_MODEL") or "deepseek-flash",
+                messages=[{"role": "system", "content": instructions},
+                          {"role": "user", "content": question}],
+                extra_body={"thinking": {"type": "disabled"}},
+                max_tokens=300,
+            )
+        answer = response.choices[0].message.content
+        return answer.strip() if answer else None
+    except (OpenAIError, ValueError, IndexError, AttributeError, TypeError) as exc:
         logging.warning("Guest AI unavailable (%s)", type(exc).__name__)
         return None
 
@@ -132,6 +133,10 @@ def reply(db, role, uid, message, admins, botname):
         if command == "/attendance":
             count, party, veg = db.execute("SELECT count(*),sum(party),sum(veg) FROM guests WHERE party IS NOT NULL").fetchone()
             return f"{count} RSVPs · {party or 0} guests · {veg or 0} vegetarian meals"
+        if command == "/start":
+            return "Welcome to Wedding Desk. Tell me what to arrange, or ask for the schedule, headcount, or guest invite link."
+        if not command.startswith("/"):
+            return organizer.chat(db, uid, message, lambda cmd: reply(db, role, uid, cmd, admins, botname))
         return ORG_HELP
 
     if command == "/start" and arg == invite:

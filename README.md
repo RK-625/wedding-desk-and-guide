@@ -1,4 +1,4 @@
-# Wedding Telegram bots
+# Wedding Desk & Guide
 
 Two private Telegram chats share one wedding itinerary. Organizers publish events, record private booking notes, maintain guest FAQs, and see RSVP totals. Guests join by invitation, look up times and venues, ask about topics such as parking, and change their party size and vegetarian meal count. A booking is an organizer’s record of arrangements made with the vendor.
 
@@ -25,7 +25,9 @@ The app loads .env alongside bots.py. WEDDING_DB defaults to wedding.sqlite3 in 
 
 ## First wedding walkthrough
 
-In the organizer bot’s private chat, send these messages separately:
+Wedding Desk accepts plain language with DeepSeek enabled. Try “Add the sangeet to the guest itinerary on December 12, 2026 at 6 PM at Lotus Hall,” then “Give me the guest invitation link.”
+
+The equivalent commands in the organizer bot’s private chat are:
 
 ```
 /event 2026-12-12 18:00 | Sangeet | Lotus Hall
