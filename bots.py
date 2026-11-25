@@ -1,5 +1,4 @@
 """Two Telegram bots, one wedding, one local database. Python 3.9+."""
-import json
 import logging
 import os
 import secrets
@@ -7,10 +6,11 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
-from urllib.parse import urlencode
-from urllib.request import urlopen, Request
+from pathlib import Path
+from dotenv import load_dotenv
+from telebot import TeleBot, apihelper
 
-DB = os.getenv("WEDDING_DB", "wedding.sqlite3")
+
 ORG_HELP = """Organizer commands (times are IST)
 /event 2026-12-12 18:00 | Sangeet | Lotus Hall
 /booking 2026-12-12 14:00 | Caterer meeting | Hotel lobby
@@ -18,11 +18,15 @@ ORG_HELP = """Organizer commands (times are IST)
 /bookings — private booking notes
 /remove 3 — delete item by ID
 /invite — guest invitation link
+/faq parking | Use the east gate — publish a guest answer
+/faqs — see published answers
+/unfaq parking — remove an answer
 /attendance — confirmed guests and vegetarian meals"""
 GUEST_HELP = """Welcome to the wedding! Try asking “Where is the sangeet?” or “What’s next?”
 /schedule — times and venues
 /rsvp 3 2 — confirm 3 guests including 2 vegetarian meals
-/myrsvp — check your reply"""
+/myrsvp — check your reply
+/faqs — local guidance from your hosts"""
 
 
 def setup(db):
@@ -31,6 +35,8 @@ def setup(db):
     CREATE TABLE IF NOT EXISTS guests(id INTEGER PRIMARY KEY, party INTEGER, veg INTEGER);
     CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT,
         at TEXT, name TEXT, place TEXT);
+    CREATE TABLE IF NOT EXISTS faqs(topic TEXT PRIMARY KEY, answer TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY, role TEXT, chat INTEGER, body TEXT);
     CREATE TABLE IF NOT EXISTS cursor(role TEXT PRIMARY KEY, offset INTEGER);
     """)
     db.execute("INSERT OR IGNORE INTO config VALUES ('invite',?)", (secrets.token_urlsafe(18),))
@@ -46,6 +52,14 @@ def render(rows, private=False):
                      for i, at, name, place in rows) or "No entries yet."
 
 
+def guidance(db):
+    return db.execute("SELECT topic,answer FROM faqs ORDER BY topic").fetchall()
+
+
+def show_guidance(rows):
+    return "\n".join(f"{topic} — {answer}" for topic, answer in rows) or "Your hosts haven’t posted any answers yet."
+
+
 def reply(db, role, uid, message, admins, botname):
     command, _, arg = message.strip().partition(" ")
     command = command.split("@")[0].lower()
@@ -53,6 +67,18 @@ def reply(db, role, uid, message, admins, botname):
     if role == "organizer":
         if uid not in admins:
             return "This bot is for the wedding organizers. Ask your host for the guest invitation."
+        if command == "/faq":
+            topic, _, answer = arg.partition("|")
+            topic, answer = topic.strip().casefold(), answer.strip()
+            if not topic or not answer:
+                return "Use /faq parking | Use the east gate."
+            db.execute("INSERT OR REPLACE INTO faqs VALUES(?,?)", (topic, answer))
+            return f"Published guidance for {topic}."
+        if command == "/unfaq":
+            changed = db.execute("DELETE FROM faqs WHERE topic=?", (arg.strip().casefold(),)).rowcount
+            return "Answer removed." if changed else "No answer under that topic."
+        if command == "/faqs":
+            return show_guidance(guidance(db))
         if command in ("/event", "/booking"):
             fields = [field.strip() for field in arg.split("|")]
             try:
@@ -83,6 +109,8 @@ def reply(db, role, uid, message, admins, botname):
     guest = db.execute("SELECT party,veg FROM guests WHERE id=?", (uid,)).fetchone()
     if guest is None:
         return "Open the invitation link from your wedding organizer, then tap Start."
+    if command == "/faqs":
+        return show_guidance(guidance(db))
     if command == "/rsvp":
         try:
             party, veg = map(int, arg.split())
@@ -106,43 +134,97 @@ def reply(db, role, uid, message, admins, botname):
         upcoming = [event for event in events if event[1] >= now]
         return render(upcoming[:1]) if upcoming else "No upcoming event is listed yet."
     matches = [event for event in events if event[2].casefold() in question]
-    return render(matches) if matches else GUEST_HELP
+    answers = [row for row in guidance(db) if row[0] in question]
+    parts = []
+    if matches:
+        parts.append(render(matches))
+    if answers:
+        parts.append(show_guidance(answers))
+    return "\n".join(parts) or GUEST_HELP
 
 
-def api(token, method, **params):
-    req = Request(f"https://api.telegram.org/bot{token}/{method}", data=urlencode(params).encode())
-    with urlopen(req, timeout=40) as res:
-        return json.load(res)["result"]
+def process_updates(db, role, bot, admins, guest_name):
+    # Commit the reply and the offset together so retrying cannot create a second event.
+    flush_replies(db, role, bot)
+    cursor = db.execute("SELECT offset FROM cursor WHERE role=?", (role,)).fetchone()
+    updates = bot.get_updates(offset=cursor[0] if cursor else 0, allowed_updates=["message"])
+    for update in updates:
+        msg = update.message
+        with db:
+            if msg and msg.chat.type == "private" and msg.from_user:
+                if msg.text == "/id":
+                    answer = f"Your Telegram user ID is {msg.from_user.id}."
+                else:
+                    answer = reply(db, role, msg.from_user.id, msg.text or "/help", admins, guest_name)
+                for start in range(0, len(answer), 2000):
+                    db.execute("INSERT INTO replies(role,chat,body) VALUES(?,?,?)",
+                               (role, msg.chat.id, answer[start:start+2000]))
+            db.execute("INSERT OR REPLACE INTO cursor VALUES(?,?)", (role, update.update_id + 1))
+    flush_replies(db, role, bot)
 
 
-def poll(role, token, admins, guest_name):
-    with sqlite3.connect(DB, timeout=15) as db:
-        while True:
+def flush_replies(db, role, bot):
+    rows = db.execute("SELECT id,chat,body FROM replies WHERE role=? ORDER BY id", (role,)).fetchall()
+    for row_id, chat, body in rows:
+        try:
+            bot.send_message(chat, body)
+        except apihelper.ApiTelegramException as exc:
+            if exc.error_code not in (400, 403):
+                raise
+            logging.warning("%s reply could not be delivered (Telegram %d)", role, exc.error_code)
+        with db:
+            db.execute("DELETE FROM replies WHERE id=?", (row_id,))
+
+
+def poll(role, bot, admins, guest_name, database, stop):
+    with sqlite3.connect(database, timeout=15) as db:
+        while not stop.is_set():
             try:
-                row = db.execute("SELECT offset FROM cursor WHERE role=?", (role,)).fetchone()
-                for update in api(token, "getUpdates", offset=row[0] if row else 0, timeout=25):
-                    msg = update.get("message", {})
-                    chat = msg.get("chat", {})
-                    with db:
-                        answer = None
-                        if chat.get("type") == "private":
-                            answer = reply(db, role, msg["from"]["id"], msg.get("text") or "/help", admins, guest_name)
-                        db.execute("INSERT OR REPLACE INTO cursor VALUES(?,?)", (role, update["update_id"] + 1))
-                    if answer:
-                        for start in range(0, len(answer), 3500):
-                            api(token, "sendMessage", chat_id=chat["id"], text=answer[start:start+3500])
+                process_updates(db, role, bot, admins, guest_name)
             except Exception as exc:
-                logging.warning("%s Telegram operation failed (%s). Retrying polling.", role, type(exc).__name__)
-                time.sleep(3)
+                logging.warning("%s polling failed (%s)", role, type(exc).__name__)
+                delay = 3
+                if isinstance(exc, apihelper.ApiTelegramException):
+                    delay = exc.result_json.get("parameters", {}).get("retry_after", delay)
+                stop.wait(delay)
+
+
+def main():
+    load_dotenv(Path(__file__).with_name(".env"))
+    tokens = {role: os.getenv(role.upper() + "_BOT_TOKEN", "").strip() for role in ("organizer", "guest")}
+    if not all(tokens.values()) or len(set(tokens.values())) != 2:
+        raise SystemExit("Set two distinct bot tokens in .env. See .env.example.")
+    try:
+        admins = {int(x) for x in os.getenv("ORGANIZER_IDS", "").split(",") if x.strip()}
+        if any(uid <= 0 for uid in admins):
+            raise ValueError()
+    except ValueError:
+        raise SystemExit("ORGANIZER_IDS must contain comma-separated positive Telegram user IDs.")
+    try:
+        bots = {role: TeleBot(token, threaded=False) for role, token in tokens.items()}
+        names = {role: bot.get_me().username for role, bot in bots.items()}
+    except Exception as exc:
+        raise SystemExit(f"Could not connect both bots ({type(exc).__name__}). Check tokens and network.") from None
+    database = os.getenv("WEDDING_DB") or "wedding.sqlite3"
+    with sqlite3.connect(database) as db:
+        setup(db)
+    stop = threading.Event()
+    workers = []
+    for role, bot in bots.items():
+        worker = threading.Thread(target=poll, args=(role, bot, admins, names["guest"], database, stop))
+        worker.start()
+        workers.append(worker)
+    print(f"Running @{names['organizer']} and @{names['guest']}. Press Ctrl-C to stop.", flush=True)
+    try:
+        while all(worker.is_alive() for worker in workers):
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for worker in workers:
+            worker.join()
 
 
 if __name__ == "__main__":
-    tokens = {role: os.environ[role.upper() + "_BOT_TOKEN"] for role in ("organizer", "guest")}
-    if len(set(tokens.values())) != 2:
-        raise SystemExit("Set two distinct BotFather tokens.")
-    admins = {int(x.strip()) for x in os.environ["ORGANIZER_IDS"].split(",")}
-    guest_name = api(tokens["guest"], "getMe")["username"]
-    with sqlite3.connect(DB) as connection:
-        setup(connection)
-    for role, token in tokens.items():
-        threading.Thread(target=poll, args=(role, token, admins, guest_name)).start()
+    main()

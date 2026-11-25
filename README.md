@@ -1,34 +1,41 @@
 # Wedding Telegram bots
 
-Run one organizer bot and one guest bot for a single wedding. Both read the same SQLite file. The organizer posts the guest itinerary and separately records private booking or meeting notes. Recording a booking does not reserve a venue or contact a vendor.
+Two private Telegram chats share one wedding itinerary. Organizers publish events, record private booking notes, maintain guest FAQs, and see RSVP totals. Guests join by invitation, look up times and venues, ask about topics such as parking, and change their party size and vegetarian meal count. A booking is an organizer’s record of arrangements made with the vendor.
 
-## Run locally
+## Install and verify locally
 
-Use Python 3.9+ with the Asia/Kolkata time zone installed. No pip packages are required.
-
-1. In Telegram, open @BotFather and use /newbot twice. Give each bot its own username. Use fresh bots configured for polling.
-2. Obtain the organizer's numeric Telegram user ID. For a fresh organizer bot, send it a private message, then call getUpdates before starting the program. The ID is in message.from.id.
-3. Open a terminal in this folder and set the environment variables below, replacing the placeholders. Keep both tokens private.
+Use Python 3.9+ with SQLite and Asia/Kolkata timezone data. A current Python build linked against OpenSSL 1.1.1+ is recommended for HTTPS. In this folder run:
 
 ```sh
-export ORGANIZER_BOT_TOKEN='organizer-token'
-export GUEST_BOT_TOKEN='guest-token'
-export ORGANIZER_IDS='123456789'
-python3 bots.py
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest -v
 ```
 
-For multiple organizers, separate their numeric IDs with commas. Keep the process running with internet access. WEDDING_DB optionally sets the database path. Keep the database private and reuse it across restarts.
+The tests use two pyTelegramBotAPI clients, a simulated Telegram API, and a temporary database. They run without credentials.
 
-## Try the two sides
+## Connect Telegram
 
-In a private chat with the organizer bot, send these as separate messages:
+1. Create two polling bots with @BotFather using /newbot twice.
+2. Copy the configuration template with `cp .env.example .env`. Fill in ORGANIZER_BOT_TOKEN and GUEST_BOT_TOKEN with their respective tokens.
+3. Set ORGANIZER_IDS to a comma-separated list of numeric Telegram user IDs. To discover yours, start the app with this field empty, send /id to the organizer bot in private, then fill in the returned ID and restart. An empty list locks organizer actions.
+4. Run `.venv/bin/python bots.py`. Keep one instance running with internet access. Both bots use long polling. If reusing bots, first disable any existing webhooks and other pollers.
+
+The app loads .env alongside bots.py. WEDDING_DB defaults to wedding.sqlite3 in the current working directory. Keep the database across restarts. The existing starter database upgrades on startup.
+
+## First wedding walkthrough
+
+In the organizer bot’s private chat, send these messages separately:
 
 ```
 /event 2026-12-12 18:00 | Sangeet | Lotus Hall
 /booking 2026-12-12 14:00 | Caterer meeting | Hotel lobby
+/faq parking | Use the east gate beside Lotus Hall.
 /invite
 ```
 
-Open the returned guest link in Telegram and tap Start. Anyone with the link can join. In the guest chat, send “Where is the sangeet?”, then /rsvp 3 2. In the organizer chat, /attendance shows the updated totals. A second RSVP from the same account replaces its earlier counts. Use /help in either chat for commands.
+Open the invitation in the guest bot and tap Start. Anyone with the invitation can join. Ask “Where is the sangeet?” or “Where is parking?”, then send /rsvp 3 2. Run /attendance as the organizer. Send /rsvp 2 1 as the same guest to see the totals change.
 
-Guest guidance currently supports text queries by event name, the next event, and the schedule. This starter runs independently of the three hackathon sponsor services.
+Use /help in either bot to see its commands. All event times are IST. Guest questions match published event names and FAQ topics. Private bookings are visible only to allowlisted organizers. Use /remove with an item ID from /schedule or /bookings to remove an event or booking.
+
+This text-based MVP runs before adding Sarvam voice transcription, Flagsmith, or NudgeBee. A real Telegram session requires your bot credentials.
