@@ -39,3 +39,7 @@ Open the invitation in the guest bot and tap Start. Anyone with the invitation c
 Use /help in either bot to see its commands. All event times are IST. Guest questions match published event names and FAQ topics. Private bookings are visible only to allowlisted organizers. Use /remove with an item ID from /schedule or /bookings to remove an event or booking.
 
 This text-based MVP runs before adding Sarvam voice transcription, Flagsmith, or NudgeBee. A real Telegram session requires your bot credentials.
+
+## Optional conversational guest guidance
+
+Set DEEPSEEK_API_KEY in .env and restart the bots. Invited guests can ask free-text questions. Wedding Guide sends the current question, published itinerary and host FAQs to DeepSeek. Each question is independent. Commands are handled locally, and keyword matching takes over if the service is unavailable. DEEPSEEK_MODEL optionally overrides deepseek-flash.
