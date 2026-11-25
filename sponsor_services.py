@@ -11,7 +11,7 @@ import requests
 def _environment_flags(key, refresh_window):
     try:
         response = requests.get(
-            "https://edge.api.flagsmith.com/api/v1/flags/",
+            "https://api.flagsmith.com/api/v1/flags/",
             headers={"X-Environment-Key": key}, timeout=4, allow_redirects=False,
         )
         response.raise_for_status()
