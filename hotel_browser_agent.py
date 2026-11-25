@@ -253,7 +253,7 @@ def search(cdp_url, provider, details, search_url, schema):
         with sync_playwright() as runtime, OpenAI(
                 api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com",
                 max_retries=0) as client:
-            browser = runtime.chromium.connect_over_cdp(cdp_url, timeout=milliseconds(12))
+            browser = runtime.chromium.connect_over_cdp(cdp_url, timeout=milliseconds(35))
             stage = "browser page setup"
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.new_page()
