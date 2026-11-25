@@ -10,6 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI, OpenAIError
 import organizer
+import stays
+import hotels_worker
+import json
 from telebot import TeleBot, apihelper
 
 
@@ -23,10 +26,13 @@ ORG_HELP = """Organizer commands (times are IST)
 /faq parking | Use the east gate — publish a guest answer
 /faqs — see published answers
 /unfaq parking — remove an answer
+/stays — recent accommodation requests
+/staystatus 1 — search progress and quotes
 /attendance — confirmed guests and vegetarian meals"""
 GUEST_HELP = """Welcome to the wedding! Try asking “Where is the sangeet?” or “What’s next?”
 /schedule — times and venues
 /rsvp 3 2 — confirm 3 guests including 2 vegetarian meals
+/stay — request hotel options for your family
 /myrsvp — check your reply
 /faqs — local guidance from your hosts"""
 
@@ -42,6 +48,8 @@ def setup(db):
     CREATE TABLE IF NOT EXISTS replies(id INTEGER PRIMARY KEY, role TEXT, chat INTEGER, body TEXT);
     CREATE TABLE IF NOT EXISTS cursor(role TEXT PRIMARY KEY, offset INTEGER);
     """)
+    stays.setup(db)
+    hotels_worker.setup(db)
     db.execute("INSERT OR IGNORE INTO config VALUES ('invite',?)", (secrets.token_urlsafe(18),))
     db.commit()
 
@@ -98,6 +106,27 @@ def reply(db, role, uid, message, admins, botname):
     if role == "organizer":
         if uid not in admins:
             return "This bot is for the wedding organizers. Ask your host for the guest invitation."
+        if command == "/stays":
+            rows = db.execute("SELECT id, details FROM stay_requests ORDER BY id DESC LIMIT 20")
+            lines = []
+            for number, raw in rows:
+                stay = json.loads(raw)
+                lines.append(f"#{number} · {stay['destination']} · {stay['check_in']} to {stay['check_out']}")
+            return "\n".join(lines) or "No guest hotel requests yet."
+        if command == "/staystatus":
+            number = arg.strip().lstrip("#")
+            request = db.execute("SELECT guest,details FROM stay_requests WHERE id=?", (number,)).fetchone()
+            if not request:
+                return "No hotel request with that number. Send /stays to see recent requests."
+            heading = f"Guest ID {request[0]}\n{stays.summary(json.loads(request[1]))}\n"
+            report = hotels_worker.report(db, number)
+            if report:
+                return heading + report
+            jobs = db.execute("SELECT provider,status FROM stay_jobs WHERE request_id=? ORDER BY provider",
+                              (number,)).fetchall()
+            if jobs:
+                return heading + "Stay #" + number + "\n" + "\n".join(f"{provider}: {status}" for provider, status in jobs)
+            return "No hotel request with that number. Send /stays to see recent requests."
         if command == "/faq":
             topic, _, answer = arg.partition("|")
             topic, answer = topic.strip().casefold(), answer.strip()
@@ -162,6 +191,9 @@ def reply(db, role, uid, message, admins, botname):
         return render(events)
     if command in ("/start", "/help"):
         return GUEST_HELP
+    stay_reply = stays.handle(db, uid, message, admins)
+    if stay_reply is not None:
+        return stay_reply
     question = message.casefold()
     if "next" in question.split() or "next?" in question:
         from zoneinfo import ZoneInfo
@@ -249,7 +281,10 @@ def main():
     with sqlite3.connect(database) as db:
         setup(db)
     stop = threading.Event()
-    workers = []
+    hotel_thread = threading.Thread(target=hotels_worker.worker, args=(database, admins, stop),
+                                    name="hotel-search")
+    hotel_thread.start()
+    workers = [hotel_thread]
     for role, bot in bots.items():
         worker = threading.Thread(target=poll, args=(role, bot, admins, names["guest"], database, stop))
         worker.start()

@@ -8,6 +8,8 @@ from unittest.mock import patch
 from requests import Response, ConnectionError
 from telebot import TeleBot, apihelper
 from bots import setup, process_updates
+import hotels_worker
+from test_hotels_worker import DETAILS, QUOTE
 
 
 class WeddingTest(unittest.TestCase):
@@ -84,6 +86,42 @@ class WeddingTest(unittest.TestCase):
         self.assertEqual("", self.send("organizer", "/schedule", chat_type="group"))
         org("/remove 1")
         self.assertIn("No entries", guest("/schedule"))
+
+    @patch.dict("os.environ", TINYFISH_API_KEY="test")
+    def test_family_hotel_request_and_organizer_report(self):
+        def guest(text):
+            return self.send("guest", text)
+
+        def desk(text):
+            return self.send("organizer", text)
+
+        self.assertIn("invitation", guest("We need a hotel"))
+        guest("/start " + desk("/invite").split("?start=")[1])
+        with patch("stays.extract", return_value=dict(DETAILS, intent=True, clarify=None)):
+            self.assertIn("Whitefield", guest("Find a hotel for our family"))
+        self.assertEqual(self.db.execute("select count(*) from stay_jobs").fetchone()[0], 0)
+        self.assertIn("#1 sent", guest("search"))
+        self.assertIn("Guest hotel request #1", desk("/stays"))
+        with patch("hotels_worker.api", side_effect=[
+            {"run_id": "booking-123"}, {"run_id": "expedia-123"},
+            {"status": "COMPLETED", "result": {"quotes": [QUOTE]}},
+            {"status": "FAILED"},
+        ]):
+            for _ in range(2):
+                hotels_worker.step(self.db, {10})
+            self.db.close()
+            self.db = sqlite3.connect(self.path)
+            self.db.execute("UPDATE stay_jobs SET next_at=0")
+            self.db.commit()
+            for _ in range(2):
+                hotels_worker.step(self.db, {10})
+        result = desk("/staystatus 1")
+        self.assertIn("8,999.00", result)
+        self.assertIn("Expedia", result)
+        self.assertIn(QUOTE["url"], result)
+        self.assertNotIn(QUOTE["url"], self.send("organizer", "/staystatus 1", uid=20))
+        self.assertNotIn(QUOTE["url"], guest("/staystatus 1"))
+        self.assertEqual(self.db.execute("SELECT count(*) FROM stay_reports").fetchone()[0], 1)
 
     def test_delivery_retry(self):
         self.offline = True

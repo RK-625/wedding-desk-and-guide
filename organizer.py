@@ -15,6 +15,8 @@ ACTIONS = {
     "schedule": ("Read the published itinerary with item IDs", ()),
     "bookings": ("Read private booking notes with item IDs", ()),
     "attendance": ("Read confirmed guest and meal totals", ()),
+    "stays": ("List guest hotel requests with their IDs", ()),
+    "staystatus": ("Read the search progress and hotel quotes for a guest request", ("request_id",)),
     "invite": ("Get the guest invitation link for the organizer", ()),
     "faq": ("Publish a guest FAQ or replace its answer", ("topic", "answer")),
     "faqs": ("Read the published FAQs", ()),
