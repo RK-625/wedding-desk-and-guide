@@ -24,7 +24,7 @@ PROPERTY_PATH = {"booking": re.compile(r"/hotel/[a-z]{2}/[^/]+\.html"),
 BARRIER = re.compile(r"verify (?:that )?you are (?:a )?human|confirm you are (?:a )?human|"
                      r"captcha|access denied|security checkpoint|checking your browser|"
                      r"robot check|verify (?:that )?you.re human", re.I)
-BUDGET_SECONDS = 95
+BUDGET_SECONDS = 150
 MAX_TURNS = 10
 EVIDENCE = ("hotel", "availability_evidence", "total_evidence", "taxes", "requirements_evidence",
             "room_configuration", "locality", "distance")
@@ -284,7 +284,7 @@ def search(cdp_url, provider, details, search_url, schema):
                         page.locator(selector).first.wait_for(state="visible", timeout=milliseconds(5))
                     except PlaywrightError:
                         pass
-                body = compact(page.locator("body").evaluate(BODY, timeout=milliseconds(6)))
+                body = compact(page.locator("body").evaluate(BODY, timeout=milliseconds(20)))
                 if BARRIER.search(body[:3000]):
                     return "", "Provider displayed a human verification or access checkpoint."
                 return body, ""
@@ -307,7 +307,7 @@ def search(cdp_url, provider, details, search_url, schema):
                     stage = "DeepSeek tool selection"
                     response = client.chat.completions.create(
                         model=os.getenv("DEEPSEEK_MODEL") or "deepseek-flash",
-                        messages=messages, tools=tools, max_tokens=1250, timeout=remaining(16),
+                        messages=messages, tools=tools, max_tokens=1250, timeout=remaining(30),
                         extra_body={"thinking": {"type": "disabled"}})
                     msg = response.choices[0].message
                     if not msg.tool_calls:
